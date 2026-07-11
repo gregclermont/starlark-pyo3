@@ -1141,17 +1141,19 @@ struct ScopedModuleState {
 
 /// A Starlark module composed as a bag of pending operations. Values and
 /// callables set on the module, and other :class:`FrozenModule` s imported
-/// via :meth:`import_public_symbols`, are applied to a freshly materialized
-/// underlying Starlark module at the start of each evaluation.
+/// via ``import_public_symbols`` or ``reexport_public_symbols``, are applied
+/// to a freshly materialized underlying Starlark module at the start of
+/// each evaluation.
 ///
 /// Unlike :class:`Module`, a ``ScopedModule`` does not retain state from
 /// prior evaluations. To chain evaluations, feed :attr:`EvalResult.module`
-/// from one evaluation into the next via :meth:`import_public_symbols`.
+/// from one evaluation into the next via ``reexport_public_symbols``.
 ///
 /// .. automethod:: __getitem__
 /// .. automethod:: __setitem__
 /// .. automethod:: add_callable
 /// .. automethod:: import_public_symbols
+/// .. automethod:: reexport_public_symbols
 /// .. automethod:: freeze
 #[pyclass]
 struct ScopedModule(Mutex<ScopedModuleState>);
@@ -1211,8 +1213,8 @@ impl ScopedModule {
     /// module, but are NOT re-exported by :meth:`freeze` or subsequent evals.
     ///
     /// If you want carry-forward across a chain of evaluations (so imports
-    /// survive the next :meth:`freeze`), use :meth:`reexport_public_symbols`
-    /// instead. See the module docstring for the full comparison.
+    /// survive the next :meth:`freeze`), use ``reexport_public_symbols``
+    /// instead. See the class docstring for the full comparison.
     #[pyo3(text_signature = "(fmod: FrozenModule) -> None")]
     fn import_public_symbols(slf: &Bound<Self>, fmod: Py<FrozenModule>) {
         let this = slf.borrow();

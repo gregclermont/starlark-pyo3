@@ -117,3 +117,13 @@ Parsing and Evaluation
 .. autofunction:: parse
 .. autofunction:: eval
 .. autofunction:: eval_with
+
+Experimental
+------------
+
+The following API is exposed at runtime but is exploratory. See
+``doc/experiments/scoped-module.md`` for the writeup.
+
+.. autoclass:: ScopedModule
+.. autofunction:: eval_scoped
+.. autofunction:: eval_scoped_with
