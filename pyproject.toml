@@ -74,6 +74,11 @@ exclude = [
     "build",
     ".env",
     "venv",
+    # python/ contains source injected into the extension at build time via
+    # include_str! — not standalone Python modules. See src/lib.rs (session
+    # namespace loader). Type-checking as standalone requires injected
+    # globals we can't easily represent.
+    "python",
 ]
 
 # This reports even cycles that are qualified by 'if TYPE_CHECKING'. Not what

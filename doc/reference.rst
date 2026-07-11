@@ -128,9 +128,11 @@ The following API is exposed at runtime but is exploratory. See
 .. autofunction:: eval_scoped
 .. autofunction:: eval_scoped_with
 
-The ``starlark.session`` submodule mirrors the top-level
-:class:`~starlark.Module` API surface on top of
-:class:`~starlark.ScopedModule` internals. At runtime, ``sl.session.Module``,
-``sl.session.eval``, and ``sl.session.eval_with`` are accessible; their
-signatures parallel :class:`~starlark.Module`, :func:`~starlark.eval`, and
-:func:`~starlark.eval_with` respectively.
+The ``starlark.session`` namespace (a class used as a namespace, not a
+submodule) mirrors the top-level :class:`~starlark.Module` API surface on
+top of :class:`~starlark.ScopedModule` internals. At runtime,
+``sl.session.Module``, ``sl.session.eval``, and ``sl.session.eval_with``
+are accessible; their signatures parallel :class:`~starlark.Module`,
+:func:`~starlark.eval`, and :func:`~starlark.eval_with` respectively. The
+namespace is defined in pure Python (``python/session.py``) and injected
+at extension import time.

@@ -411,19 +411,23 @@ Everything else — accumulating state, post-eval variable reads, FileLoader int
 
 ### Implementation
 
-`sl.session.Module` is a Rust `#[pyclass(name = "Module", module = "starlark.session")]` whose state is `Mutex<{pending_values, pending_callables, last_frozen}>`. On each eval:
+`sl.session` is defined in pure Python at ``python/session.py`` as a class-used-as-namespace with a nested ``Module`` class and static ``eval`` / ``eval_with`` methods. At extension import time, ``src/lib.rs`` reads that Python source (via ``include_str!`` so the source is embedded in the compiled ``.so``), executes it with the underlying scoped-module primitives (``ScopedModule``, ``eval_scoped``, ``eval_scoped_with``) pre-populated in globals, extracts the resulting ``session`` class, and attaches it to the ``starlark`` module.
 
-1. Materialize a fresh underlying `starlark::environment::Module`
-2. Re-export prior `last_frozen` public names as public in the new module
-3. Apply pending values (shadowing re-exports)
-4. Apply pending callables (shadowing values)
-5. Run `Evaluator::eval_module`
-6. Freeze into `FrozenModule`
-7. Store as new `last_frozen`, clear pending
+The wrapper's ``Module`` stores ``{pending_values, pending_callables, last_frozen}`` as plain Python dicts and an optional ``FrozenModule`` reference. On each eval:
 
-Reads via `__getitem__` check pending values, then pending callables, then look through to `last_frozen` via `FrozenModule.__contains__` / `__getitem__`.
+1. Build a fresh ``sl.ScopedModule`` from the pending state:
+    a. If ``last_frozen`` exists, ``reexport_public_symbols(last_frozen)``
+    b. Apply pending values via ``scoped[name] = v``
+    c. Apply pending callables via ``scoped.add_callable(name, cb)``
+2. Call ``sl.eval_scoped(scoped, ast, globals, file_loader)`` (or ``sl.eval_scoped_with(...)``)
+3. Store the resulting ``FrozenModule`` as the new ``last_frozen``, clear pending
+4. Return the value (or the ``EvalResult``)
 
-At runtime the namespace is a proper Python submodule (`import starlark.session` works). For type checkers, `starlark.pyi` uses a class-as-namespace pattern (`class _SessionNS:` with a nested `Module`, then `session: type[_SessionNS]`) since a separate stub file would require restructuring the binding into a package layout.
+Reads via ``__getitem__`` check pending values, then pending callables, then look through to ``last_frozen`` via ``FrozenModule.__contains__`` / ``__getitem__``.
+
+Because it's a class-as-namespace and not a real Python submodule, ``import starlark.session`` doesn't work — only ``from starlark import session`` (which returns the class). Users who write ``sl.session.eval(...)`` see identical behavior to a submodule; only the import syntax is affected.
+
+Total Rust footprint for this feature: ~15 lines in the pymodule init (read the file, execute with globals, attach the class). All the wrapper logic lives in ~50 lines of Python. The Rust primitives (``ScopedModule``, ``eval_scoped``, ``eval_scoped_with``, ``FrozenModule.__contains__``, ``FrozenModule.__getitem__``) are shared with the base experiment.
 
 ## The pure-Python `Session` prototype
 
