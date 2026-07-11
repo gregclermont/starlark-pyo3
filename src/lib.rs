@@ -1118,6 +1118,131 @@ impl EvalOptions {
 
 // }}}
 
+// {{{ ScopedModule (Direction A experiment)
+
+// Direction A shape: sl.ScopedModule is a plain builder of pending operations
+// (values, callables, and FrozenModule imports). It never holds a live
+// starlark::environment::Module across pyo3 calls. Every eval materializes a
+// fresh module inside the eval helper, applies pending, runs, and freezes.
+// The frozen product is returned on EvalResult.module — the surface iterative
+// workflows use to chain across evaluations.
+struct ScopedModuleState {
+    values: HashMap<String, Py<PyAny>>,
+    callables: HashMap<String, Py<PyAny>>,
+    imports: Vec<Py<FrozenModule>>,
+}
+
+/// A Starlark module composed as a bag of pending operations. Values and
+/// callables set on the module, and other :class:`FrozenModule` s imported
+/// via :meth:`import_public_symbols`, are applied to a freshly materialized
+/// underlying Starlark module at the start of each evaluation.
+///
+/// Unlike :class:`Module`, a ``ScopedModule`` does not retain state from
+/// prior evaluations. To chain evaluations, feed :attr:`EvalResult.module`
+/// from one evaluation into the next via :meth:`import_public_symbols`.
+///
+/// .. automethod:: __getitem__
+/// .. automethod:: __setitem__
+/// .. automethod:: add_callable
+/// .. automethod:: import_public_symbols
+/// .. automethod:: freeze
+#[pyclass]
+struct ScopedModule(Mutex<ScopedModuleState>);
+
+#[pymethods]
+impl ScopedModule {
+    #[new]
+    #[pyo3(text_signature = "() -> None")]
+    fn py_new() -> PyResult<ScopedModule> {
+        Ok(ScopedModule(Mutex::new(ScopedModuleState {
+            values: HashMap::new(),
+            callables: HashMap::new(),
+            imports: Vec::new(),
+        })))
+    }
+
+    /// Look up a pending value or callable by name. Returns ``None`` for
+    /// keys that were never set. Reads do not see values produced by an
+    /// evaluation — use :attr:`EvalResult.module` for that.
+    fn __getitem__(slf: &Bound<Self>, name: &str) -> PyResult<Py<PyAny>> {
+        Python::attach(|py| {
+            let this = slf.borrow();
+            let state = this.0.lock().unwrap();
+            if let Some(v) = state.values.get(name) {
+                return Ok(v.clone_ref(py));
+            }
+            if let Some(cb) = state.callables.get(name) {
+                return Ok(cb.clone_ref(py));
+            }
+            Ok(py.None())
+        })
+    }
+
+    /// Set a value on the module. The value is converted to Starlark at
+    /// evaluation time, not at assignment time.
+    fn __setitem__(slf: &Bound<Self>, name: &str, obj: Py<PyAny>) -> PyResult<()> {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.callables.remove(name);
+        state.values.insert(name.to_string(), obj);
+        Ok(())
+    }
+
+    /// Register a Python callable to be exposed as a Starlark function.
+    #[pyo3(text_signature = "(name: str, callable: Callable) -> None")]
+    fn add_callable(slf: &Bound<Self>, name: &str, callable: Py<PyAny>) {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.values.remove(name);
+        state.callables.insert(name.to_string(), callable);
+    }
+
+    /// Import the public symbols of *fmod* into this module. All imports are
+    /// applied before any assigned values or callables at evaluation start.
+    #[pyo3(text_signature = "(fmod: FrozenModule) -> None")]
+    fn import_public_symbols(slf: &Bound<Self>, fmod: Py<FrozenModule>) {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.imports.push(fmod);
+    }
+
+    /// Materialize a fresh Starlark module, apply pending imports and
+    /// bindings, and freeze without evaluating any script. Useful for
+    /// preparing a "context module" to feed into other evaluations.
+    #[pyo3(text_signature = "() -> FrozenModule")]
+    fn freeze(slf: &Bound<Self>) -> PyResult<FrozenModule> {
+        let py = slf.py();
+        let state = slf.borrow();
+        let inner = state.0.lock().unwrap();
+        let module = starlark::environment::Module::new();
+        apply_pending_ops(py, &module, &inner)?;
+        Ok(FrozenModule(convert_freeze_err(module.freeze())?))
+    }
+}
+
+fn apply_pending_ops(
+    py: Python<'_>,
+    module: &starlark::environment::Module,
+    state: &ScopedModuleState,
+) -> PyResult<()> {
+    for py_fmod in &state.imports {
+        module.import_public_symbols(&py_fmod.bind(py).get().0);
+    }
+    for (name, py_val) in &state.values {
+        let v = pyobject_to_value(py_val.bind(py).clone(), module.heap())?;
+        module.set(name, v);
+    }
+    for (name, py_cb) in &state.callables {
+        let val = module.heap().alloc(PythonCallableValue {
+            callable: py_cb.clone_ref(py),
+        });
+        module.set(name, val);
+    }
+    Ok(())
+}
+
+// }}}
+
 // {{{ FrozenModule
 
 /// .. automethod:: call
@@ -1155,7 +1280,7 @@ impl FrozenModule {
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<EvalResult> {
         let value = frozen_module_call(slf, name, args, kwargs, Some(options.get()))?;
-        Ok(EvalResult { value })
+        Ok(EvalResult { value, module: None })
     }
 }
 
@@ -1381,24 +1506,106 @@ fn eval_with(
     file_loader: Option<&Bound<FileLoader>>,
 ) -> PyResult<EvalResult> {
     let value = eval_impl(module, ast, globals, file_loader, Some(options.get()))?;
-    Ok(EvalResult { value })
+    Ok(EvalResult { value, module: None })
+}
+
+/// Like :func:`eval_with`, but evaluates against a :class:`ScopedModule` and
+/// returns an :class:`EvalResult` whose :attr:`~EvalResult.module` field
+/// carries the frozen module of the evaluation's end state. Pending values,
+/// callables, and imports on the ``ScopedModule`` are applied to a freshly
+/// materialized underlying Starlark module for this evaluation and then
+/// discarded — the ``ScopedModule`` is not mutated.
+///
+/// :arg options: An :class:`EvalOptions` bundle.
+/// :arg module: A :class:`ScopedModule` carrying pending initial bindings.
+/// :returns: An :class:`EvalResult` with ``.value`` (the evaluation's return)
+///     and ``.module`` (a :class:`FrozenModule` of the end state).
+#[pyfunction]
+#[pyo3(
+    signature = (options, module, ast, globals, /, file_loader=None),
+    text_signature = "(options: EvalOptions, module: ScopedModule, ast: AstModule, globals: Globals, /, file_loader: FileLoader | None = None) -> EvalResult"
+)]
+fn eval_scoped_with(
+    options: &Bound<EvalOptions>,
+    module: &Bound<ScopedModule>,
+    ast: &Bound<AstModule>,
+    globals: &Globals,
+    file_loader: Option<&Bound<FileLoader>>,
+) -> PyResult<EvalResult> {
+    let py = module.py();
+    let opts_ref = options.get();
+    let cancel_state = opts_ref
+        .check_cancelled
+        .as_ref()
+        .map(|cb| CancelledState::new(cb.clone_ref(py)));
+
+    // Materialize a fresh underlying Starlark module and apply pending ops.
+    let starlark_module = starlark::environment::Module::new();
+    {
+        let state = module.borrow();
+        let inner = state.0.lock().unwrap();
+        apply_pending_ops(py, &starlark_module, &inner)?;
+    }
+
+    let tail = |evaluator: &mut starlark::eval::Evaluator| {
+        value_to_pyobject(convert_starlark_err(
+            evaluator.eval_module(ast.borrow().0.clone(), &globals.0),
+        )?)
+    };
+
+    let result = match file_loader {
+        Some(loader_cell) => {
+            let loader_ref = loader_cell.borrow();
+            let mut evaluator = starlark::eval::Evaluator::new(&starlark_module);
+            evaluator.set_loader(&*loader_ref);
+            apply_eval_opts(&mut evaluator, Some(opts_ref), cancel_state.as_ref())?;
+            tail(&mut evaluator)
+        }
+        None => {
+            let mut evaluator = starlark::eval::Evaluator::new(&starlark_module);
+            apply_eval_opts(&mut evaluator, Some(opts_ref), cancel_state.as_ref())?;
+            tail(&mut evaluator)
+        }
+    };
+
+    if let Some(state) = cancel_state.as_ref() {
+        if let Some(err) = state.take_error() {
+            return Err(err);
+        }
+    }
+    let value = result?;
+
+    // Freeze the evaluated module into a FrozenModule for EvalResult.module.
+    let frozen = convert_freeze_err(starlark_module.freeze())?;
+    let py_frozen = Py::new(py, FrozenModule(frozen))?;
+
+    Ok(EvalResult {
+        value,
+        module: Some(py_frozen),
+    })
 }
 
 // }}}
 
 // {{{ EvalResult
 
-/// Rich result of an evaluation returned by :func:`eval_with` and
-/// :meth:`FrozenModule.call_with`. Currently wraps only the return
-/// value; future post-eval readouts (tick counts, profile output,
-/// coverage) will land as additional read-only fields.
+/// Rich result of an evaluation returned by :func:`eval_with`,
+/// :func:`eval_scoped_with`, and :meth:`FrozenModule.call_with`.
+/// Future post-eval readouts (tick counts, profile output, coverage)
+/// will land as additional read-only fields.
 ///
 /// .. autoattribute:: value
 ///
 ///     The value returned by the evaluation, after :ref:`object-conversion`.
+/// .. autoattribute:: module
+///
+///     For evaluations that produce a durable module (currently only
+///     :func:`eval_scoped_with`), the frozen module of the evaluation's
+///     end state. ``None`` otherwise.
 #[pyclass(frozen)]
 struct EvalResult {
     value: Py<PyAny>,
+    module: Option<Py<FrozenModule>>,
 }
 
 #[pymethods]
@@ -1406,6 +1613,10 @@ impl EvalResult {
     #[getter]
     fn value(&self, py: Python<'_>) -> Py<PyAny> {
         self.value.clone_ref(py)
+    }
+    #[getter]
+    fn module(&self, py: Python<'_>) -> Option<Py<FrozenModule>> {
+        self.module.as_ref().map(|m| m.clone_ref(py))
     }
 }
 
@@ -1429,6 +1640,7 @@ fn starlark_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Globals>()?;
     m.add_class::<OpaquePythonObject>()?;
     m.add_class::<Module>()?;
+    m.add_class::<ScopedModule>()?;
     m.add_class::<FrozenModule>()?;
     m.add_class::<FileLoader>()?;
     m.add_class::<EvalOptions>()?;
@@ -1436,6 +1648,7 @@ fn starlark_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(parse))?;
     m.add_wrapped(wrap_pyfunction!(eval))?;
     m.add_wrapped(wrap_pyfunction!(eval_with))?;
+    m.add_wrapped(wrap_pyfunction!(eval_scoped_with))?;
     m.add("StarlarkError", m.py().get_type::<StarlarkError>())?;
 
     Ok(())

@@ -47,8 +47,10 @@ __all__: Sequence[str] = [
     "ResolvedFileSpan",
     "ResolvedPos",
     "ResolvedSpan",
+    "ScopedModule",
     "StarlarkError",
     "eval",
+    "eval_scoped_with",
     "eval_with",
     "parse",
 ]
@@ -182,6 +184,17 @@ class EvalOptions:
 class EvalResult:
     @property
     def value(self) -> object: ...
+    @property
+    def module(self) -> FrozenModule | None: ...
+
+@final
+class ScopedModule:
+    def __new__(cls) -> ScopedModule: ...
+    def __getitem__(self, key: str, /) -> object: ...
+    def __setitem__(self, key: str, value: object, /) -> None: ...
+    def add_callable(self, name: str, callable: Callable[..., object]) -> None: ...
+    def import_public_symbols(self, fmod: FrozenModule, /) -> None: ...
+    def freeze(self) -> FrozenModule: ...
 
 @final
 class FrozenModule:
@@ -216,6 +229,14 @@ def eval(
 def eval_with(
     options: EvalOptions,
     module: Module,
+    ast: AstModule,
+    globals: Globals,
+    /,
+    file_loader: FileLoader | None = None,
+) -> EvalResult: ...
+def eval_scoped_with(
+    options: EvalOptions,
+    module: ScopedModule,
     ast: AstModule,
     globals: Globals,
     /,
