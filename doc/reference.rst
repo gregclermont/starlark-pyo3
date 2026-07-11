@@ -127,3 +127,10 @@ The following API is exposed at runtime but is exploratory. See
 .. autoclass:: ScopedModule
 .. autofunction:: eval_scoped
 .. autofunction:: eval_scoped_with
+
+The ``starlark.session`` submodule mirrors the top-level
+:class:`~starlark.Module` API surface on top of
+:class:`~starlark.ScopedModule` internals. At runtime, ``sl.session.Module``,
+``sl.session.eval``, and ``sl.session.eval_with`` are accessible; their
+signatures parallel :class:`~starlark.Module`, :func:`~starlark.eval`, and
+:func:`~starlark.eval_with` respectively.

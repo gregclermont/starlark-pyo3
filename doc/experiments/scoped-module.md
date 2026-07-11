@@ -339,9 +339,95 @@ With one new public symbol added per generation, cumulative name/slot table meta
 
 `import_public_symbols` doesn't have this problem — private imports don't propagate through freeze cycles.
 
-## The `Session` pattern
+## The `sl.session` namespace
 
-A pure-Python convenience wrapper that makes the iterative REPL-style flow feel like `sl.Module`'s implicit accumulation, at the cost of the semantic caveats catalogued above:
+An extension of the `Session` pattern, exposed as a first-class submodule namespace whose API surface mirrors the top-level `sl.eval` / `sl.Module` shape. Under the hood, the class delegates to the same ScopedModule + FrozenModule chaining logic; from the outside, users write code that looks like `sl.Module` code with a namespace prefix.
+
+```python
+mod = sl.session.Module()
+mod["a"] = 5
+mod.add_callable("triple", lambda x: x * 3)
+
+# Same call shape as sl.eval(mod, ast, glb):
+val = sl.session.eval(mod, sl.parse("s1.star", "b = triple(a)"), glb)
+# val is None; side effect: session state now has a, b, triple
+
+# Post-eval reads work like sl.Module:
+assert mod["b"] == 15
+assert mod["a"] == 5
+
+# Multi-eval chains, like sl.Module:
+sl.session.eval(mod, sl.parse("s2.star", "c = b + 1"), glb)
+assert mod["c"] == 16
+
+# Freeze and call, like sl.Module.freeze():
+fmod = mod.freeze()
+assert fmod.call("triple", 7) == 21
+```
+
+### API mapping
+
+Every function that takes a `sl.Module` has a parallel that takes a `sl.session.Module`:
+
+| Top-level | Under `sl.session` |
+|---|---|
+| `sl.Module()` | `sl.session.Module()` |
+| `sl.eval(module, ast, globals, file_loader=None) -> object` | `sl.session.eval(module, ast, globals, file_loader=None) -> object` |
+| `sl.eval_with(options, module, ast, globals, /, file_loader=None) -> EvalResult` | `sl.session.eval_with(options, module, ast, globals, /, file_loader=None) -> EvalResult` |
+| `mod[name]` (read post-eval variable) | Same |
+| `mod[name] = v` | Same |
+| `mod.add_callable(name, cb)` | Same |
+| `mod.freeze()` | Same |
+
+Signatures are identical position-by-position and name-by-name. The only difference is the type of `module`: `sl.Module` at the top level, `sl.session.Module` under the namespace.
+
+### The one call-shape gap
+
+You cannot pass a `sl.session.Module` to top-level `sl.eval()` or `sl.eval_with()`, and vice versa — they're different types. If a caller wants to use the parallel namespace, all references to eval and Module must be prefixed with `sl.session.`.
+
+### FrozenModule protocols
+
+`FrozenModule` gains two Python protocols that support the session read pattern (`mod[name]` looking through to the frozen product) and are useful independently:
+
+- **`FrozenModule.__contains__(name) -> bool`** — is `name` a public symbol?
+- **`FrozenModule.__getitem__(name) -> object`** — get the value, raising `KeyError` if missing or `StarlarkError` if not Python-convertible (matches the semantics of `sl.Module.__getitem__`).
+
+Both are natural Python protocols. They also make `sl.FrozenModule` behave like a read-only mapping for its public symbols:
+
+```python
+if "x" in fmod:
+    val = fmod["x"]
+```
+
+### Inherent semantic differences
+
+The session namespace hides most of the ScopedModule semantics, but three differences from `sl.Module` remain visible because they come from the underlying Starlark value model:
+
+1. **Frozen closure globals across evaluations.** A `def f(): return x` defined in eval 1 reads eval 1's frozen `x`, not eval 2's reassigned `x`. Under `sl.Module` the function sees the mutated module slot. Verified in `test_session_module_frozen_function_globals_across_evals`.
+2. **`freeze()` doesn't empty the wrapper.** `sl.Module.freeze()` moves state out; `sl.session.Module.freeze()` is a pure function of session state. Session state remains intact after freeze.
+3. **Type incompatibility.** `sl.session.Module` is not an `sl.Module`; call sites for `sl.eval` and `sl.eval_with` require the top-level type.
+
+Everything else — accumulating state, post-eval variable reads, FileLoader integration, callable registration, freezing to a callable FrozenModule — behaves identically.
+
+### Implementation
+
+`sl.session.Module` is a Rust `#[pyclass(name = "Module", module = "starlark.session")]` whose state is `Mutex<{pending_values, pending_callables, last_frozen}>`. On each eval:
+
+1. Materialize a fresh underlying `starlark::environment::Module`
+2. Re-export prior `last_frozen` public names as public in the new module
+3. Apply pending values (shadowing re-exports)
+4. Apply pending callables (shadowing values)
+5. Run `Evaluator::eval_module`
+6. Freeze into `FrozenModule`
+7. Store as new `last_frozen`, clear pending
+
+Reads via `__getitem__` check pending values, then pending callables, then look through to `last_frozen` via `FrozenModule.__contains__` / `__getitem__`.
+
+At runtime the namespace is a proper Python submodule (`import starlark.session` works). For type checkers, `starlark.pyi` uses a class-as-namespace pattern (`class _SessionNS:` with a nested `Module`, then `session: type[_SessionNS]`) since a separate stub file would require restructuring the binding into a package layout.
+
+## The pure-Python `Session` prototype
+
+This was the pre-`sl.session` sketch: a pure-Python convenience wrapper that made the iterative REPL-style flow feel like `sl.Module`'s implicit accumulation, at the cost of the semantic caveats catalogued above. The `sl.session` namespace above is essentially this pattern promoted into the binding as a first-class Rust `#[pyclass]` with matching top-level function signatures. The Python sketch is kept in the tests as a reference and to show that any user could write the same wrapper without binding support:
 
 ```python
 class Session:

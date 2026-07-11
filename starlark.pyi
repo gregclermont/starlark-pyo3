@@ -54,6 +54,7 @@ __all__: Sequence[str] = [
     "eval_scoped_with",
     "eval_with",
     "parse",
+    "session",
 ]
 
 @final
@@ -209,6 +210,8 @@ class FrozenModule:
         *args: object,
         **kwargs: object,
     ) -> EvalResult: ...
+    def __contains__(self, name: str, /) -> bool: ...
+    def __getitem__(self, name: str, /) -> object: ...
 
 @final
 class Module:
@@ -250,3 +253,37 @@ def eval_scoped_with(
     /,
     file_loader: FileLoader | None = None,
 ) -> EvalResult: ...
+
+# The `starlark.session` submodule (experimental).
+# Type checkers see it via the class-as-namespace pattern below;
+# at runtime it is a proper submodule and `import starlark.session` works.
+# See doc/experiments/scoped-module.md.
+class _SessionNS:
+    @final
+    class Module:
+        def __init__(self) -> None: ...
+        def __getitem__(self, key: str, /) -> object: ...
+        def __setitem__(self, key: str, value: object, /) -> None: ...
+        def add_callable(
+            self, name: str, callable: Callable[..., object]
+        ) -> None: ...
+        def freeze(self) -> FrozenModule: ...
+
+    @staticmethod
+    def eval(
+        module: _SessionNS.Module,
+        ast: AstModule,
+        globals: Globals,
+        file_loader: FileLoader | None = None,
+    ) -> object: ...
+    @staticmethod
+    def eval_with(
+        options: EvalOptions,
+        module: _SessionNS.Module,
+        ast: AstModule,
+        globals: Globals,
+        /,
+        file_loader: FileLoader | None = None,
+    ) -> EvalResult: ...
+
+session: type[_SessionNS]

@@ -1300,15 +1300,292 @@ fn apply_pending_ops(
 
 // }}}
 
+// {{{ session namespace (sl.session.Module + sl.session.eval + sl.session.eval_with)
+
+// The `session` namespace exposes a parallel API to the top-level eval/Module:
+// same function signatures, same call shape (module in the same positional
+// slot), but backed by ScopedModule internals. See doc/experiments/
+// scoped-module.md for the semantic differences that are inherent to the
+// scoped-module backing.
+
+struct SessionModuleState {
+    pending_values: HashMap<String, Py<PyAny>>,
+    pending_callables: HashMap<String, Py<PyAny>>,
+    last_frozen: Option<Py<FrozenModule>>,
+}
+
+/// A module wrapper providing :class:`Module`-like ergonomics on top of the
+/// scope-safe internals of :class:`ScopedModule`. Instances are used with
+/// :func:`session.eval` and :func:`session.eval_with`, which mirror the
+/// signatures of the top-level :func:`~starlark.eval` and
+/// :func:`~starlark.eval_with` but take a ``session.Module`` in place of
+/// :class:`~starlark.Module`.
+///
+/// State accumulates across evaluations. Reads via ``__getitem__`` return
+/// pending values first, then values from the most recent frozen product
+/// (converted per :ref:`object-conversion`).
+///
+/// See ``doc/experiments/scoped-module.md`` for the semantic differences
+/// from :class:`~starlark.Module` that are inherent to the scoped-module
+/// backing (frozen closure globals across evaluations, container mutability
+/// across evaluations, freeze idempotency, and non-passability to the
+/// top-level ``sl.eval`` / ``sl.eval_with``).
+///
+/// .. automethod:: __getitem__
+/// .. automethod:: __setitem__
+/// .. automethod:: add_callable
+/// .. automethod:: freeze
+#[pyclass(name = "Module", module = "starlark.session")]
+struct SessionModule(Mutex<SessionModuleState>);
+
+#[pymethods]
+impl SessionModule {
+    #[new]
+    #[pyo3(text_signature = "() -> None")]
+    fn py_new() -> PyResult<SessionModule> {
+        Ok(SessionModule(Mutex::new(SessionModuleState {
+            pending_values: HashMap::new(),
+            pending_callables: HashMap::new(),
+            last_frozen: None,
+        })))
+    }
+
+    /// Return the value bound to *name*: pending values and callables first,
+    /// then the most recent evaluation's frozen product. Returns ``None`` if
+    /// *name* is unbound.
+    fn __getitem__(slf: &Bound<Self>, name: &str) -> PyResult<Py<PyAny>> {
+        Python::attach(|py| {
+            let this = slf.borrow();
+            let state = this.0.lock().unwrap();
+            if let Some(v) = state.pending_values.get(name) {
+                return Ok(v.clone_ref(py));
+            }
+            if let Some(cb) = state.pending_callables.get(name) {
+                return Ok(cb.clone_ref(py));
+            }
+            if let Some(frozen) = &state.last_frozen {
+                let fmod = frozen.bind(py).get();
+                if fmod.__contains__(name) {
+                    return fmod.__getitem__(name);
+                }
+            }
+            Ok(py.None())
+        })
+    }
+
+    /// Record *value* to be bound to *name* at the next evaluation.
+    fn __setitem__(slf: &Bound<Self>, name: &str, obj: Py<PyAny>) -> PyResult<()> {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.pending_callables.remove(name);
+        state.pending_values.insert(name.to_string(), obj);
+        Ok(())
+    }
+
+    /// Record a Python callable to be exposed at *name* at the next evaluation.
+    #[pyo3(text_signature = "(name: str, callable: Callable) -> None")]
+    fn add_callable(slf: &Bound<Self>, name: &str, callable: Py<PyAny>) {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.pending_values.remove(name);
+        state.pending_callables.insert(name.to_string(), callable);
+    }
+
+    /// Materialize the current session state (re-exported prior frozen +
+    /// pending) into a :class:`~starlark.FrozenModule` without evaluating any
+    /// script. Does not mutate this ``Module``.
+    #[pyo3(text_signature = "() -> FrozenModule")]
+    fn freeze(slf: &Bound<Self>) -> PyResult<FrozenModule> {
+        let py = slf.py();
+        let this = slf.borrow();
+        let state = this.0.lock().unwrap();
+        let module = starlark::environment::Module::new();
+        apply_session_state(py, &module, &state)?;
+        Ok(FrozenModule(convert_freeze_err(module.freeze())?))
+    }
+}
+
+fn apply_session_state(
+    py: Python<'_>,
+    module: &starlark::environment::Module,
+    state: &SessionModuleState,
+) -> PyResult<()> {
+    // Re-export prior frozen state as public so it survives future freezes.
+    if let Some(frozen) = &state.last_frozen {
+        let fmod = &frozen.bind(py).get().0;
+        for name in fmod.names() {
+            let owned = convert_anyhow_err(fmod.get(name.as_str()))?;
+            let value = owned.owned_value(module.frozen_heap());
+            module.set(name.as_str(), value);
+        }
+    }
+    // Pending values shadow re-exports.
+    for (name, py_val) in &state.pending_values {
+        let v = pyobject_to_value(py_val.bind(py).clone(), module.heap())?;
+        module.set(name, v);
+    }
+    // Pending callables shadow values and re-exports.
+    for (name, py_cb) in &state.pending_callables {
+        let val = module.heap().alloc(PythonCallableValue {
+            callable: py_cb.clone_ref(py),
+        });
+        module.set(name, val);
+    }
+    Ok(())
+}
+
+fn session_eval_impl(
+    module: &Bound<SessionModule>,
+    ast: &Bound<AstModule>,
+    globals: &Globals,
+    file_loader: Option<&Bound<FileLoader>>,
+    options: Option<&EvalOptions>,
+) -> PyResult<Py<PyAny>> {
+    let py = module.py();
+
+    let cancel_state = options
+        .and_then(|o| o.check_cancelled.as_ref())
+        .map(|cb| CancelledState::new(cb.clone_ref(py)));
+
+    // Materialize a fresh underlying module with the session state applied.
+    let starlark_module = starlark::environment::Module::new();
+    {
+        let this = module.borrow();
+        let state = this.0.lock().unwrap();
+        apply_session_state(py, &starlark_module, &state)?;
+    }
+
+    let tail = |evaluator: &mut starlark::eval::Evaluator| {
+        value_to_pyobject(convert_starlark_err(
+            evaluator.eval_module(ast.borrow().0.clone(), &globals.0),
+        )?)
+    };
+
+    let result = match file_loader {
+        Some(loader_cell) => {
+            let loader_ref = loader_cell.borrow();
+            let mut evaluator = starlark::eval::Evaluator::new(&starlark_module);
+            evaluator.set_loader(&*loader_ref);
+            apply_eval_opts(&mut evaluator, options, cancel_state.as_ref())?;
+            tail(&mut evaluator)
+        }
+        None => {
+            let mut evaluator = starlark::eval::Evaluator::new(&starlark_module);
+            apply_eval_opts(&mut evaluator, options, cancel_state.as_ref())?;
+            tail(&mut evaluator)
+        }
+    };
+
+    if let Some(state) = cancel_state.as_ref() {
+        if let Some(err) = state.take_error() {
+            return Err(err);
+        }
+    }
+    let value = result?;
+
+    // Freeze the evaluated module and update the session's frozen state.
+    let frozen = convert_freeze_err(starlark_module.freeze())?;
+    let py_frozen = Py::new(py, FrozenModule(frozen))?;
+
+    {
+        let this = module.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.last_frozen = Some(py_frozen);
+        state.pending_values.clear();
+        state.pending_callables.clear();
+    }
+
+    Ok(value)
+}
+
+/// Evaluate *ast* against *module* (a :class:`session.Module`).
+///
+/// Mirrors the top-level :func:`~starlark.eval`: returns the value produced
+/// by evaluating *ast*, and updates *module*'s internal state so that
+/// subsequent :func:`eval` calls, and reads via ``module[name]``, see the
+/// definitions produced by this evaluation.
+///
+/// :returns: the value returned by the evaluation, after :ref:`object-conversion`.
+#[pyfunction]
+#[pyo3(
+    name = "eval",
+    signature = (module, ast, globals, file_loader=None),
+    text_signature = "(module: Module, ast: AstModule, globals: Globals, file_loader: FileLoader | None = None) -> object"
+)]
+fn session_eval(
+    module: &Bound<SessionModule>,
+    ast: &Bound<AstModule>,
+    globals: &Globals,
+    file_loader: Option<&Bound<FileLoader>>,
+) -> PyResult<Py<PyAny>> {
+    session_eval_impl(module, ast, globals, file_loader, None)
+}
+
+/// Like :func:`eval`, but takes an :class:`~starlark.EvalOptions` bundle and
+/// returns an :class:`~starlark.EvalResult`. Mirrors the top-level
+/// :func:`~starlark.eval_with`.
+///
+/// :returns: an :class:`~starlark.EvalResult`. ``.value`` is the evaluation's
+///     return; ``.module`` is a :class:`~starlark.FrozenModule` of the new
+///     session end-state (the same frozen module that will back subsequent
+///     reads via ``module[name]``).
+#[pyfunction]
+#[pyo3(
+    name = "eval_with",
+    signature = (options, module, ast, globals, /, file_loader=None),
+    text_signature = "(options: EvalOptions, module: Module, ast: AstModule, globals: Globals, /, file_loader: FileLoader | None = None) -> EvalResult"
+)]
+fn session_eval_with(
+    options: &Bound<EvalOptions>,
+    module: &Bound<SessionModule>,
+    ast: &Bound<AstModule>,
+    globals: &Globals,
+    file_loader: Option<&Bound<FileLoader>>,
+) -> PyResult<EvalResult> {
+    let value = session_eval_impl(module, ast, globals, file_loader, Some(options.get()))?;
+    let py = module.py();
+    let this = module.borrow();
+    let state = this.0.lock().unwrap();
+    let frozen_module = state.last_frozen.as_ref().map(|f| f.clone_ref(py));
+    Ok(EvalResult {
+        value,
+        module: frozen_module,
+    })
+}
+
+// }}}
+
 // {{{ FrozenModule
 
 /// .. automethod:: call
 /// .. automethod:: call_with
+/// .. automethod:: __contains__
+/// .. automethod:: __getitem__
 #[pyclass(frozen)]
 struct FrozenModule(starlark::environment::FrozenModule);
 
 #[pymethods]
 impl FrozenModule {
+    /// Return whether *name* is a public symbol of this module.
+    fn __contains__(&self, name: &str) -> bool {
+        self.0.get_option(name).map(|v| v.is_some()).unwrap_or(false)
+    }
+
+    /// Return the value bound to *name*, converted per :ref:`object-conversion`.
+    /// Raises :class:`KeyError` if *name* is not a public symbol of this module;
+    /// raises :class:`StarlarkError` if the value is not Python-convertible
+    /// (functions and native Starlark values fall into this case).
+    fn __getitem__(&self, name: &str) -> PyResult<Py<PyAny>> {
+        match convert_anyhow_err(self.0.get_option(name))? {
+            Some(owned) => {
+                let heap = starlark::values::FrozenHeap::new();
+                let value = owned.owned_value(&heap);
+                value_to_pyobject(value)
+            }
+            None => Err(pyo3::exceptions::PyKeyError::new_err(name.to_string())),
+        }
+    }
+
     /// .. versionadded:: 2025.2.2
     /// .. versionchanged:: 2025.2.3
     ///
@@ -1726,6 +2003,19 @@ fn starlark_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(eval_scoped))?;
     m.add_wrapped(wrap_pyfunction!(eval_scoped_with))?;
     m.add("StarlarkError", m.py().get_type::<StarlarkError>())?;
+
+    // Experimental sl.session namespace — sl.Module-like ergonomics backed by
+    // ScopedModule internals. See doc/experiments/scoped-module.md.
+    let session_mod = PyModule::new(m.py(), "session")?;
+    session_mod.add_class::<SessionModule>()?;
+    session_mod.add_function(wrap_pyfunction!(session_eval, &session_mod)?)?;
+    session_mod.add_function(wrap_pyfunction!(session_eval_with, &session_mod)?)?;
+    m.add_submodule(&session_mod)?;
+    // Register in sys.modules so `from starlark.session import ...` works.
+    m.py()
+        .import("sys")?
+        .getattr("modules")?
+        .set_item("starlark.session", &session_mod)?;
 
     Ok(())
 }
