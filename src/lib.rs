@@ -1226,7 +1226,18 @@ fn apply_pending_ops(
     state: &ScopedModuleState,
 ) -> PyResult<()> {
     for py_fmod in &state.imports {
-        module.import_public_symbols(&py_fmod.bind(py).get().0);
+        // NOTE: We intentionally re-expose imported symbols as PUBLIC so that
+        // iterated import chains carry symbols forward. Upstream's
+        // `Module::import_public_symbols` stores imports as private (matching
+        // `load()` semantics where imported symbols aren't re-exported); for
+        // our REPL-style carry-forward, that would drop all imported symbols
+        // after one freeze cycle. See test_scoped_module_transitive_import_retention.
+        let fmod = &py_fmod.bind(py).get().0;
+        for name in fmod.names() {
+            let owned = convert_anyhow_err(fmod.get(name.as_str()))?;
+            let value = owned.owned_value(module.frozen_heap());
+            module.set(name.as_str(), value);
+        }
     }
     for (name, py_val) in &state.values {
         let v = pyobject_to_value(py_val.bind(py).clone(), module.heap())?;
@@ -1509,6 +1520,24 @@ fn eval_with(
     Ok(EvalResult { value, module: None })
 }
 
+/// Bare-options variant of :func:`eval_scoped_with`. Convenience for callers
+/// with no evaluator options to configure.
+#[pyfunction]
+#[pyo3(
+    signature = (module, ast, globals, file_loader=None),
+    text_signature = "(module: ScopedModule, ast: AstModule, globals: Globals, file_loader: FileLoader | None = None) -> EvalResult"
+)]
+fn eval_scoped(
+    module: &Bound<ScopedModule>,
+    ast: &Bound<AstModule>,
+    globals: &Globals,
+    file_loader: Option<&Bound<FileLoader>>,
+) -> PyResult<EvalResult> {
+    let py = module.py();
+    let default_opts = Py::new(py, EvalOptions::py_new(py, None, None)?)?;
+    eval_scoped_with(default_opts.bind(py), module, ast, globals, file_loader)
+}
+
 /// Like :func:`eval_with`, but evaluates against a :class:`ScopedModule` and
 /// returns an :class:`EvalResult` whose :attr:`~EvalResult.module` field
 /// carries the frozen module of the evaluation's end state. Pending values,
@@ -1648,6 +1677,7 @@ fn starlark_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(parse))?;
     m.add_wrapped(wrap_pyfunction!(eval))?;
     m.add_wrapped(wrap_pyfunction!(eval_with))?;
+    m.add_wrapped(wrap_pyfunction!(eval_scoped))?;
     m.add_wrapped(wrap_pyfunction!(eval_scoped_with))?;
     m.add("StarlarkError", m.py().get_type::<StarlarkError>())?;
 

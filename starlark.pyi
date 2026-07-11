@@ -50,6 +50,7 @@ __all__: Sequence[str] = [
     "ScopedModule",
     "StarlarkError",
     "eval",
+    "eval_scoped",
     "eval_scoped_with",
     "eval_with",
     "parse",
@@ -232,6 +233,12 @@ def eval_with(
     ast: AstModule,
     globals: Globals,
     /,
+    file_loader: FileLoader | None = None,
+) -> EvalResult: ...
+def eval_scoped(
+    module: ScopedModule,
+    ast: AstModule,
+    globals: Globals,
     file_loader: FileLoader | None = None,
 ) -> EvalResult: ...
 def eval_scoped_with(
