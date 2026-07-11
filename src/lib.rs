@@ -1129,7 +1129,14 @@ impl EvalOptions {
 struct ScopedModuleState {
     values: HashMap<String, Py<PyAny>>,
     callables: HashMap<String, Py<PyAny>>,
-    imports: Vec<Py<FrozenModule>>,
+    // Upstream-shaped imports: symbols enter as private in the destination,
+    // matching Starlark `load()` semantics — usable in scripts, not
+    // re-exported by the next freeze.
+    private_imports: Vec<Py<FrozenModule>>,
+    // Public re-exports: symbols enter as public, so they survive the next
+    // freeze and remain visible to downstream imports. Enables the
+    // iterative "session" carry-forward pattern.
+    reexports: Vec<Py<FrozenModule>>,
 }
 
 /// A Starlark module composed as a bag of pending operations. Values and
@@ -1157,7 +1164,8 @@ impl ScopedModule {
         Ok(ScopedModule(Mutex::new(ScopedModuleState {
             values: HashMap::new(),
             callables: HashMap::new(),
-            imports: Vec::new(),
+            private_imports: Vec::new(),
+            reexports: Vec::new(),
         })))
     }
 
@@ -1197,13 +1205,43 @@ impl ScopedModule {
         state.callables.insert(name.to_string(), callable);
     }
 
-    /// Import the public symbols of *fmod* into this module. All imports are
-    /// applied before any assigned values or callables at evaluation start.
+    /// Import the public symbols of *fmod* into this module, matching
+    /// Starlark's ``load()`` semantics — imported symbols enter as **private**
+    /// in the receiving module. They are usable in scripts run against this
+    /// module, but are NOT re-exported by :meth:`freeze` or subsequent evals.
+    ///
+    /// If you want carry-forward across a chain of evaluations (so imports
+    /// survive the next :meth:`freeze`), use :meth:`reexport_public_symbols`
+    /// instead. See the module docstring for the full comparison.
     #[pyo3(text_signature = "(fmod: FrozenModule) -> None")]
     fn import_public_symbols(slf: &Bound<Self>, fmod: Py<FrozenModule>) {
         let this = slf.borrow();
         let mut state = this.0.lock().unwrap();
-        state.imports.push(fmod);
+        state.private_imports.push(fmod);
+    }
+
+    /// Re-export the public symbols of *fmod* into this module as **public**,
+    /// so that a subsequent :meth:`freeze` produces a :class:`FrozenModule`
+    /// whose public namespace includes them. This is the operation for
+    /// iterative "session" workflows where each evaluation composes on top
+    /// of a prior :attr:`EvalResult.module`.
+    ///
+    /// This differs from Starlark's ``load()`` semantics (private import)
+    /// and from :meth:`import_public_symbols`. Symbols accumulate: repeated
+    /// re-export across many chained evaluations produces a monotonically
+    /// growing public namespace on the receiving module. Users doing
+    /// long-lived REPL-style sessions should be aware that:
+    ///
+    /// - Frozen-heap references from every prior link in the chain remain
+    ///   live via the receiving module's frozen heap.
+    /// - The public name/slot table grows with each re-export step, since
+    ///   old public bindings survive unless deliberately shadowed by a new
+    ///   value or callable of the same name.
+    #[pyo3(text_signature = "(fmod: FrozenModule) -> None")]
+    fn reexport_public_symbols(slf: &Bound<Self>, fmod: Py<FrozenModule>) {
+        let this = slf.borrow();
+        let mut state = this.0.lock().unwrap();
+        state.reexports.push(fmod);
     }
 
     /// Materialize a fresh Starlark module, apply pending imports and
@@ -1225,13 +1263,17 @@ fn apply_pending_ops(
     module: &starlark::environment::Module,
     state: &ScopedModuleState,
 ) -> PyResult<()> {
-    for py_fmod in &state.imports {
-        // NOTE: We intentionally re-expose imported symbols as PUBLIC so that
-        // iterated import chains carry symbols forward. Upstream's
-        // `Module::import_public_symbols` stores imports as private (matching
-        // `load()` semantics where imported symbols aren't re-exported); for
-        // our REPL-style carry-forward, that would drop all imported symbols
-        // after one freeze cycle. See test_scoped_module_transitive_import_retention.
+    // 1. Private imports first (upstream-shaped): symbols enter as private.
+    //    Delegates to upstream's `import_public_symbols` which uses
+    //    `set_private` internally, matching `load()` semantics.
+    for py_fmod in &state.private_imports {
+        module.import_public_symbols(&py_fmod.bind(py).get().0);
+    }
+    // 2. Re-exports second (public): iterate public names from the source
+    //    frozen module and re-set them as public in the destination. This
+    //    is what enables iterative carry-forward across freeze cycles. Public
+    //    re-exports may shadow private imports on name conflict.
+    for py_fmod in &state.reexports {
         let fmod = &py_fmod.bind(py).get().0;
         for name in fmod.names() {
             let owned = convert_anyhow_err(fmod.get(name.as_str()))?;
@@ -1239,10 +1281,12 @@ fn apply_pending_ops(
             module.set(name.as_str(), value);
         }
     }
+    // 3. Pending values (public) shadow any imported/re-exported name.
     for (name, py_val) in &state.values {
         let v = pyobject_to_value(py_val.bind(py).clone(), module.heap())?;
         module.set(name, v);
     }
+    // 4. Pending callables (public) shadow values / imports / re-exports.
     for (name, py_cb) in &state.callables {
         let val = module.heap().alloc(PythonCallableValue {
             callable: py_cb.clone_ref(py),

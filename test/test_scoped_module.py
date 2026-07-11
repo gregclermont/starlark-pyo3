@@ -93,7 +93,7 @@ def test_scoped_module_import_chains_state():
     assert r1.module is not None
 
     mod2 = sl.ScopedModule()
-    mod2.import_public_symbols(r1.module)
+    mod2.reexport_public_symbols(r1.module)
 
     # x should now be visible via the import.
     ast2 = sl.parse("use-x.star", "x + 5")
@@ -111,7 +111,7 @@ def test_scoped_module_import_carries_frozen_functions():
     assert r1.module is not None
 
     mod2 = sl.ScopedModule()
-    mod2.import_public_symbols(r1.module)
+    mod2.reexport_public_symbols(r1.module)
 
     ast2 = sl.parse("call-imported.star", "double(21)")
     r2 = sl.eval_scoped_with(sl.EvalOptions(), mod2, ast2, glb)
@@ -137,7 +137,7 @@ def get_x():
 
     # Import into mod2 and shadow x with a new value.
     mod2 = sl.ScopedModule()
-    mod2.import_public_symbols(r1.module)
+    mod2.reexport_public_symbols(r1.module)
 
     ast2 = sl.parse("f2.star", """
 x = 999
@@ -192,6 +192,80 @@ def test_bare_eval_scoped_is_less_verbose():
     result = sl.eval_scoped(mod, ast, glb)
     assert result.module is not None
     assert result.module.call("f", 10) == 11
+
+
+# }}}
+
+# {{{ import (upstream/private/load-like) vs reexport (public/carry-forward)
+
+
+def test_import_public_symbols_gives_in_eval_access():
+    """import_public_symbols (upstream `load()` semantics) makes imported
+    symbols visible IN the running script, but as private in the module."""
+    glb = sl.Globals.standard()
+    origin_mod = sl.ScopedModule()
+    r_origin = sl.eval_scoped(
+        origin_mod, sl.parse("origin.star", "x = 42"), glb
+    )
+    assert r_origin.module is not None
+
+    mod = sl.ScopedModule()
+    mod.import_public_symbols(r_origin.module)  # private import
+    r = sl.eval_scoped(mod, sl.parse("use.star", "x + 1"), glb)
+    # The script can see x — private-imported symbols are still in scope
+    # for the running script.
+    assert r.value == 43
+
+
+def test_import_public_symbols_does_not_reexport_after_freeze():
+    """import_public_symbols matches upstream `load()`: imported symbols
+    do NOT survive the receiving module's freeze into a downstream chain."""
+    glb = sl.Globals.standard()
+    origin_mod = sl.ScopedModule()
+    r_origin = sl.eval_scoped(
+        origin_mod, sl.parse("origin.star", "x = 42"), glb
+    )
+    assert r_origin.module is not None
+
+    mid_mod = sl.ScopedModule()
+    mid_mod.import_public_symbols(r_origin.module)  # private
+    r_mid = sl.eval_scoped(mid_mod, sl.parse("mid.star", "y = 99"), glb)
+    assert r_mid.module is not None
+
+    # r_mid.module has y (public, from the mid eval) but NOT x — the
+    # imported x is private and drops out at freeze.
+    downstream = sl.ScopedModule()
+    downstream.reexport_public_symbols(r_mid.module)
+    r_down = sl.eval_scoped(downstream, sl.parse("down.star", "y"), glb)
+    assert r_down.value == 99
+
+    # Confirm x is gone:
+    with pytest.raises(sl.StarlarkError, match="not found"):
+        downstream2 = sl.ScopedModule()
+        downstream2.reexport_public_symbols(r_mid.module)
+        sl.eval_scoped(downstream2, sl.parse("down2.star", "x"), glb)
+
+
+def test_reexport_public_symbols_survives_downstream_freeze():
+    """reexport_public_symbols is the public-carry-forward operation:
+    imports survive freeze and remain in the downstream namespace."""
+    glb = sl.Globals.standard()
+    origin_mod = sl.ScopedModule()
+    r_origin = sl.eval_scoped(
+        origin_mod, sl.parse("origin.star", "x = 42"), glb
+    )
+    assert r_origin.module is not None
+
+    mid_mod = sl.ScopedModule()
+    mid_mod.reexport_public_symbols(r_origin.module)  # public
+    r_mid = sl.eval_scoped(mid_mod, sl.parse("mid.star", "y = 99"), glb)
+    assert r_mid.module is not None
+
+    # Downstream re-imports mid — both x and y should be visible.
+    downstream = sl.ScopedModule()
+    downstream.reexport_public_symbols(r_mid.module)
+    r_down = sl.eval_scoped(downstream, sl.parse("down.star", "x + y"), glb)
+    assert r_down.value == 141
 
 
 # }}}
@@ -254,7 +328,7 @@ def test_scoped_module_transitive_import_retention():
     # adding some padding of its own.
     for i in range(20):
         m = sl.ScopedModule()
-        m.import_public_symbols(r.module)
+        m.reexport_public_symbols(r.module)
         ast_i = sl.parse(f"iter-{i}.star", f"padding_{i} = {i * 1000}")
         r = sl.eval_scoped(m, ast_i, glb)
         assert r.module is not None
@@ -263,7 +337,7 @@ def test_scoped_module_transitive_import_retention():
     # frozen-heap chain — which means every intermediate frozen heap along
     # the chain is retained.
     final = sl.ScopedModule()
-    final.import_public_symbols(r.module)
+    final.reexport_public_symbols(r.module)
     ast_final = sl.parse("check.star", "origin_val")
     r_final = sl.eval_scoped(final, ast_final, glb)
     assert r_final.value == 12345
@@ -283,14 +357,14 @@ def test_scoped_module_deep_import_chain_padding_carries_forward():
     for i in range(1, 6):
         m = sl.ScopedModule()
         assert r.module is not None
-        m.import_public_symbols(r.module)
+        m.reexport_public_symbols(r.module)
         ast_i = sl.parse(f"iter-{i}.star", f"padding_{i} = {i}")
         r = sl.eval_scoped(m, ast_i, glb)
 
     # padding_1 through padding_5 should all be reachable in the final chain.
     assert r.module is not None
     check = sl.ScopedModule()
-    check.import_public_symbols(r.module)
+    check.reexport_public_symbols(r.module)
     ast_check = sl.parse(
         "check.star", "padding_1 + padding_2 + padding_3 + padding_4 + padding_5"
     )
@@ -332,7 +406,7 @@ class Session:
         mod = sl.ScopedModule()
         mod["_v"] = value
         if self._frozen is not None:
-            mod.import_public_symbols(self._frozen)
+            mod.reexport_public_symbols(self._frozen)
         r = sl.eval_scoped(mod, ast, self._globals)
         self._frozen = r.module
 
@@ -341,7 +415,7 @@ class Session:
     ) -> sl.EvalResult:
         mod = sl.ScopedModule()
         if self._frozen is not None:
-            mod.import_public_symbols(self._frozen)
+            mod.reexport_public_symbols(self._frozen)
         opts = options or sl.EvalOptions()
         result = sl.eval_scoped_with(opts, mod, ast, self._globals)
         self._frozen = result.module

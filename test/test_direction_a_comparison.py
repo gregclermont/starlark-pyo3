@@ -147,7 +147,7 @@ def test_scoped_multi_eval_does_not_accumulate():
 
 
 def test_scoped_multi_eval_via_explicit_import():
-    """Scoped equivalent of accumulate: use result.module + import_public_symbols."""
+    """Scoped equivalent of accumulate: use result.module + reexport_public_symbols."""
     glb = sl.Globals.standard()
     mod = sl.ScopedModule()
 
@@ -156,7 +156,7 @@ def test_scoped_multi_eval_via_explicit_import():
     assert r1.module is not None
 
     mod2 = sl.ScopedModule()
-    mod2.import_public_symbols(r1.module)
+    mod2.reexport_public_symbols(r1.module)
     ast2 = sl.parse("s2.star", "x + 1")
     assert sl.eval_scoped(mod2, ast2, glb).value == 101
 
@@ -247,7 +247,7 @@ def test_scoped_closure_globals_are_frozen_at_origin():
     # But when get_x is carried forward via import and x is shadowed in a
     # later eval, get_x reads its FROZEN origin, not the current module.
     mod2 = sl.ScopedModule()
-    mod2.import_public_symbols(r.module)
+    mod2.reexport_public_symbols(r.module)
     r2 = sl.eval_scoped(mod2, sl.parse("s2b.star", "x = 999\nget_x()"), glb)
     assert r2.value == 2  # frozen origin, NOT 999
 
@@ -281,7 +281,7 @@ def test_scoped_read_defined_vars_after_eval():
 
     # To read x, do a follow-up eval that references it via the frozen module.
     inspect_mod = sl.ScopedModule()
-    inspect_mod.import_public_symbols(r.module)
+    inspect_mod.reexport_public_symbols(r.module)
     r_inspect = sl.eval_scoped(inspect_mod, sl.parse("check.star", "x"), glb)
     assert r_inspect.value == 42
 
